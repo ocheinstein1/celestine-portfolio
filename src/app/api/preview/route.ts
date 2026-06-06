@@ -1,13 +1,25 @@
 import { NextResponse } from 'next/server';
 
-const getMetaTag = (html: string, property: string) => {
-  const regex = new RegExp(`<meta(?: [^>]+)? (?:property|name)=["']${property}["'](?: [^>]+)? content=["']([^"']+)["']`, 'i');
-  const match = html.match(regex);
-  if (match) return match[1];
-  const regexRev = new RegExp(`<meta(?: [^>]+)? content=["']([^"']+)["'](?: [^>]+)? (?:property|name)=["']${property}["']`, 'i');
-  const matchRev = html.match(regexRev);
-  return matchRev ? matchRev[1] : null;
+const getMetaTag = (html: string, property: string): string | null => {
+  const patterns = [
+    new RegExp(`<meta[^>]+(?:property|name)=["']${property}["'][^>]+content=["']([^"']+)["']`, 'i'),
+    new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']${property}["']`, 'i'),
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return null;
 };
+
+const decodeEntities = (str: string) =>
+  str
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .trim();
 
 export async function POST(request: Request) {
   try {
@@ -15,76 +27,104 @@ export async function POST(request: Request) {
     if (!url) return NextResponse.json({ error: 'URL is required' }, { status: 400 });
 
     const fetchUrl = url.startsWith('http') ? url : `https://${url}`;
+    const encodedUrl = encodeURIComponent(fetchUrl);
 
-    // --- Step 1: Try Microlink API for screenshot + metadata ---
+    // ── Step 1: Microlink API (best quality, free tier) ──
     try {
-      const microlinkRes = await fetch(
-        `https://api.microlink.io/?url=${encodeURIComponent(fetchUrl)}&screenshot=true&meta=true&embed=screenshot.url`,
-        { headers: { 'Accept': 'application/json' } }
-      );
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
 
-      if (microlinkRes.ok) {
-        const mlData = await microlinkRes.json();
-        if (mlData.status === 'success') {
-          const d = mlData.data;
+      const mlRes = await fetch(
+        `https://api.microlink.io/?url=${encodedUrl}&screenshot=true&meta=true`,
+        {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timeout);
+
+      if (mlRes.ok) {
+        const ml = await mlRes.json();
+        if (ml.status === 'success') {
+          const d = ml.data;
           return NextResponse.json({
             url: fetchUrl,
             title: d.title || fetchUrl,
             description: d.description || '',
             image: d.screenshot?.url || d.image?.url || '',
-            favicon: d.logo?.url || '',
+            favicon: d.logo?.url || `${new URL(fetchUrl).origin}/favicon.ico`,
             screenshot: d.screenshot?.url || '',
           });
         }
       }
     } catch (_) {
-      // Microlink failed — fall through to manual fetch
+      // Microlink timed out or failed — continue to fallback
     }
 
-    // --- Step 2: Manual HTML metadata fetch as fallback ---
-    const res = await fetch(fetchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-
-    if (!res.ok) {
-      return NextResponse.json({ error: 'Failed to fetch URL' }, { status: 400 });
-    }
-
-    const html = await res.text();
-
-    let title = getMetaTag(html, 'og:title') || getMetaTag(html, 'twitter:title') || html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || fetchUrl;
-    let description = getMetaTag(html, 'og:description') || getMetaTag(html, 'twitter:description') || getMetaTag(html, 'description') || '';
-    let image = getMetaTag(html, 'og:image') || getMetaTag(html, 'twitter:image') || '';
+    // ── Step 2: Manual HTML fetch for metadata ──
+    let title = fetchUrl;
+    let description = '';
+    let image = '';
     const favicon = `${new URL(fetchUrl).origin}/favicon.ico`;
 
-    title = title.replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim();
-    description = description.replace(/&#x27;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim();
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
 
-    // Handle relative image URLs
-    if (image && !image.startsWith('http')) {
-      try {
-        const urlObj = new URL(fetchUrl);
-        image = `${urlObj.protocol}//${urlObj.host}${image.startsWith('/') ? '' : '/'}${image}`;
-      } catch (_) {
-        image = '';
+      const htmlRes = await fetch(fetchUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Accept: 'text/html',
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (htmlRes.ok) {
+        const html = await htmlRes.text();
+
+        title = decodeEntities(
+          getMetaTag(html, 'og:title') ||
+          getMetaTag(html, 'twitter:title') ||
+          html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] ||
+          fetchUrl
+        );
+
+        description = decodeEntities(
+          getMetaTag(html, 'og:description') ||
+          getMetaTag(html, 'twitter:description') ||
+          getMetaTag(html, 'description') ||
+          ''
+        );
+
+        const rawImage =
+          getMetaTag(html, 'og:image') ||
+          getMetaTag(html, 'twitter:image') || '';
+
+        if (rawImage) {
+          image = rawImage.startsWith('http')
+            ? rawImage
+            : `${new URL(fetchUrl).origin}${rawImage.startsWith('/') ? '' : '/'}${rawImage}`;
+        }
       }
+    } catch (_) {
+      // HTML fetch failed — use URL as title
     }
 
-    // Use screenshotone as a last-resort screenshot fallback (no key needed for basic)
-    const screenshotUrl = `https://api.microlink.io/?url=${encodeURIComponent(fetchUrl)}&screenshot=true&embed=screenshot.url`;
+    // ── Step 3: Use screenshotone.com free endpoint for screenshot ──
+    // This gives a real browser screenshot with no API key needed
+    const screenshot = `https://api.screenshotone.com/take?url=${encodedUrl}&viewport_width=1280&viewport_height=800&format=jpg&image_quality=80`;
 
     return NextResponse.json({
       url: fetchUrl,
       title,
       description,
-      image,
+      image: image || screenshot,
       favicon,
-      screenshot: screenshotUrl,
+      screenshot,
     });
   } catch (error) {
-    return NextResponse.json({ error: 'Failed to parse URL' }, { status: 500 });
+    return NextResponse.json({ error: 'Failed to process URL' }, { status: 500 });
   }
 }
